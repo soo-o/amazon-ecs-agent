@@ -34,6 +34,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/sirupsen/logrus"
+
 	"github.com/aws/amazon-ecs-agent/agent/config"
 	"github.com/aws/amazon-ecs-agent/agent/logger"
 	"github.com/aws/amazon-ecs-agent/agent/utils"
@@ -87,6 +89,47 @@ type RequestMessage struct {
 // to be interface{} to properly capture that
 type RequestHandler interface{}
 
+// RequestResponder wraps the RequestHandler interface with a Respond()
+// method that can be used to Respond to requests read and processed via
+// the RequestHandler interface for a particular message type.
+//
+// Example:
+//
+//	type payloadMessageDispatcher struct {
+//	    respond  func(interface{}) error
+//	    dispatcher actor.Dispatcher
+//	}
+//	func(d *payloadmessagedispatcher) RegisterResponder(respond func(interface{}) error) error {
+//	    d.respond = respond
+//	    return nil
+//	}
+//	func(d *payloadmessagedispatcher) HandlerFunc() RequestHandler {
+//	    return func(payload *ecsacs.PayloadMessage) {
+//	        message := &actor.DispatcherMessage{
+//	            Payload: payload,
+//	            AckFunc: func() error {
+//	                return d.respond()
+//	            },
+//	            ...
+//	        }
+//	        d.dispatcher.Send(message)
+//	    }
+//	}
+type RequestResponder interface {
+	// Name returns the name of the responder. This is used mostly for logging.
+	Name() string
+	// RegisterResponder registers a function that can be invoked in response
+	// to receiving and processing a websocket request message.
+	RegisterResponder(RespondFunc)
+	// HandlerFunc returns the RequestHandler callback for a particular
+	// websocket request message type.
+	HandlerFunc() RequestHandler
+}
+
+// RespondFunc specifies a function callback that can be used by the
+// RequestResonder to respond to requests.
+type RespondFunc func(interface{}) error
+
 // ClientServer is a combined client and server for the backend websocket connection
 type ClientServer interface {
 	AddRequestHandler(RequestHandler)
@@ -102,6 +145,7 @@ type ClientServer interface {
 	IsConnected() bool
 	SetConnection(conn wsconn.WebsocketConn)
 	Disconnect(...interface{}) error
+	ServeWithContext(ctx context.Context) error
 	Serve() error
 	SetReadDeadline(t time.Time) error
 	io.Closer
@@ -410,6 +454,57 @@ func (cs *ClientServerImpl) ConsumeMessages() error {
 			return err
 		}
 
+	}
+}
+
+// ConsumeMessages reads messages from the websocket connection and handles read
+// messages from an active connection.
+func (cs *ClientServerImpl) ConsumeMessagesWithContext(ctx context.Context) error {
+	// Since ReadMessage is blocking, we don't want to wait for timeout when context gets cancelled
+
+	errChan := make(chan error, 1)
+	go func() {
+		for {
+			if err := cs.SetReadDeadline(time.Now().Add(cs.RWTimeout)); err != nil {
+				errChan <- err
+				return
+			}
+
+			messageType, message, err := cs.conn.ReadMessage()
+
+			switch {
+			case err == nil:
+				if messageType != websocket.TextMessage {
+					// maybe not fatal though, we'll try to process it anyways
+					logrus.WithField("messageType", messageType).Errorf("Unexpected messageType")
+				}
+
+				cs.handleMessage(message)
+
+			case permissibleCloseCode(err):
+				logrus.WithError(err).Debug("Connection closed for a valid reason")
+				errChan <- io.EOF
+				return
+
+			default:
+				// Unexpected error occurred
+				logrus.WithError(err).WithField("messageType", messageType).Error("Error getting message from ws backend")
+				errChan <- err
+				return
+			}
+		}
+	}()
+
+	for {
+		select {
+		case <-ctx.Done():
+			// Close connection and wait for Read goroutine to finish
+			_ = cs.Disconnect()
+			<-errChan
+			return ctx.Err()
+		case err := <-errChan:
+			return err
+		}
 	}
 }
 

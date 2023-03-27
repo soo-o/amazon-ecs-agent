@@ -19,13 +19,15 @@
 package acsclient
 
 import (
+	"context"
 	"errors"
 	"time"
 
-	"github.com/aws/amazon-ecs-agent/agent/config"
-	"github.com/aws/amazon-ecs-agent/agent/wsclient"
 	"github.com/aws/aws-sdk-go/aws/credentials"
 	"github.com/cihub/seelog"
+
+	"github.com/aws/amazon-ecs-agent/agent/config"
+	"github.com/aws/amazon-ecs-agent/agent/wsclient"
 )
 
 // clientServer implements ClientServer for acs.
@@ -48,15 +50,15 @@ func New(url string, cfg *config.Config, credentialProvider *credentials.Credent
 	return cs
 }
 
-// Serve begins serving requests using previously registered handlers (see
+// ServeWithContext begins serving requests using previously registered handlers (see
 // AddRequestHandler). All request handlers should be added prior to making this
 // call as unhandled requests will be discarded.
-func (cs *clientServer) Serve() error {
+func (cs *clientServer) ServeWithContext(ctx context.Context) error {
 	seelog.Debug("ACS client starting websocket poll loop")
 	if !cs.IsReady() {
 		return errors.New("acs client: websocket not ready for connections")
 	}
-	return cs.ConsumeMessages()
+	return cs.ConsumeMessagesWithContext(ctx)
 }
 
 // Close closes the underlying connection

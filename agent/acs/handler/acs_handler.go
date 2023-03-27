@@ -24,6 +24,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/sirupsen/logrus"
+
 	acsclient "github.com/aws/amazon-ecs-agent/agent/acs/client"
 	updater "github.com/aws/amazon-ecs-agent/agent/acs/update_handler"
 	"github.com/aws/amazon-ecs-agent/agent/api"
@@ -78,8 +80,8 @@ const (
 	acsProtocolVersion = 2
 	// numOfHandlersSendingAcks is the number of handlers that send acks back to ACS and that are not saved across
 	// sessions. We use this to send pending acks, before agent initiates a disconnect to ACS.
-	// they are: refreshCredentialsHandler, taskManifestHandler, and payloadHandler
-	numOfHandlersSendingAcks = 3
+	// they are: refreshCredentialsHandler and payloadHandler
+	numOfHandlersSendingAcks = 2
 )
 
 // Session defines an interface for handler's long-lived connection with ACS.
@@ -113,6 +115,8 @@ type session struct {
 	connectionTime                  time.Duration
 	connectionJitter                time.Duration
 	_inactiveInstanceReconnectDelay time.Duration
+
+	logger *logrus.Entry
 }
 
 // sessionResources defines the resource creator interface for starting
@@ -329,15 +333,18 @@ func (acsSession *session) startACSSession(client wsclient.ClientServer) error {
 	client.AddRequestHandler(instanceENIAttachHandler.handlerFunc())
 
 	// Add TaskManifestHandler
-	taskManifestHandler := newTaskManifestHandler(acsSession.ctx, cfg.Cluster, acsSession.containerInstanceARN,
+	taskManifestHandler := newTaskManifestHandler(cfg.Cluster, acsSession.containerInstanceARN,
 		client, acsSession.dataClient, acsSession.taskEngine, acsSession.latestSeqNumTaskManifest)
 
-	defer taskManifestHandler.clearAcks()
-	taskManifestHandler.start()
-	defer taskManifestHandler.stop()
-
-	client.AddRequestHandler(taskManifestHandler.handlerFuncTaskManifestMessage())
-	client.AddRequestHandler(taskManifestHandler.handlerFuncTaskStopVerificationMessage())
+	taskManifestHandler.RegisterResponder(func(response interface{}) error {
+		acsSession.logger.WithFields(logrus.Fields{
+			"Name":     taskManifestHandler.Name(),
+			"Response": response,
+		}).Debug("Sending response to ACS")
+		return client.MakeRequest(response)
+	})
+	client.AddRequestHandler(taskManifestHandler.taskManifestMessageHandler())
+	client.AddRequestHandler(taskManifestHandler.taskStopVerificationAckHandler())
 
 	// Add request handler for handling payload messages from ACS
 	payloadHandler := newPayloadRequestHandler(
@@ -372,7 +379,7 @@ func (acsSession *session) startACSSession(client wsclient.ClientServer) error {
 	// Start a connection timer; agent will send pending acks and close its ACS websocket connection
 	// after this timer expires
 	connectionTimer := newConnectionTimer(client, acsSession.connectionTime, acsSession.connectionJitter,
-		&refreshCredsHandler, &taskManifestHandler, &payloadHandler)
+		&refreshCredsHandler, &payloadHandler)
 	defer connectionTimer.Stop()
 
 	// Start a heartbeat timer for closing the connection
@@ -395,7 +402,7 @@ func (acsSession *session) startACSSession(client wsclient.ClientServer) error {
 
 	serveErr := make(chan error, 1)
 	go func() {
-		serveErr <- client.Serve()
+		serveErr <- client.ServeWithContext(acsSession.ctx)
 	}()
 
 	for {
@@ -514,7 +521,6 @@ func newConnectionTimer(
 	connectionTime time.Duration,
 	connectionJitter time.Duration,
 	refreshCredsHandler *refreshCredentialsHandler,
-	taskManifestHandler *taskManifestHandler,
 	payloadHandler *payloadRequestHandler,
 ) ttime.Timer {
 	expiresAt := retry.AddJitter(connectionTime, connectionJitter)
@@ -527,13 +533,6 @@ func newConnectionTimer(
 		// send pending creds refresh acks to ACS
 		go func() {
 			refreshCredsHandler.sendPendingAcks()
-			wg.Done()
-		}()
-
-		// send pending task manifest acks and task stop verification acks to ACS
-		go func() {
-			taskManifestHandler.sendPendingTaskManifestMessageAck()
-			taskManifestHandler.handlePendingTaskStopVerificationAck()
 			wg.Done()
 		}()
 
